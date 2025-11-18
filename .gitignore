@@ -1,3 +1,5 @@
 build/*
 test/out*
 test/log*
+blas_test/*
+blas_test

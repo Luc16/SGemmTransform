@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.13.4)
 project(SGemmDialect LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_custom_target(SGemm)
 
 # Defina o caminho para o LLVM e MLIR

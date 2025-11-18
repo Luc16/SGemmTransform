@@ -177,7 +177,7 @@ static FailureOr<Value> padToMultiples(RewriterBase &rewriter, Location loc,
   // Before creating tensor::PadOp, fast-path when no padding will be added.
   // If all computed high pads are constant 0, return the original tensor.
   bool allConstZero = llvm::all_of(highPads, [](OpFoldResult ofr) {
-    return mlir::isZeroIndex(ofr);
+    return mlir::isZeroInteger(ofr);
   });
   if (allConstZero)
     return tensor; // no-op: already multiple-aligned
@@ -804,18 +804,17 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
   // Outer level: (Mc, Kc, Nc) over (i, k, j) with interchange {0,2,1} -> loops order (i, j, k).
   GemmTileSizes ts = computeGemmTiles(mK, arch);
 
-  SmallVector<int64_t, 3> outerTileSz = {ts.Mc, ts.Kc, ts.Nc};
+  SmallVector<int64_t, 2> outerTileSz = {ts.Mc, ts.Kc};
   SmallVector<OpFoldResult> outerTileOfr =
       getAsIndexOpFoldResult(rewriter.getContext(), outerTileSz);
-  SmallVector<int64_t, 3> outerInterchange = {0, 2, 1};
+  SmallVector<int64_t, 2> outerInterchange = {0, 1}; // keep (i,k,j) order
 
   scf::SCFTilingOptions outerOpts;
   outerOpts.setTileSizes(outerTileOfr).setInterchange(outerInterchange);
   outerOpts.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
 
   rewriter.setInsertionPoint(target);
-  FailureOr<scf::SCFTilingResult> outerRes =
-      scf::tileUsingSCF(rewriter, tilingInterfaceOp, outerOpts);
+  FailureOr<scf::SCFTilingResult> outerRes = scf::tileUsingSCF(rewriter, tilingInterfaceOp, outerOpts);
   if (failed(outerRes))
     return transformOp->emitError("First level tiling for GEMM failed.");
 
@@ -831,8 +830,75 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
     rewriter.eraseOp(tilingInterfaceOp);
   }
 
-  // Inner level: (mr, nr) on inner tiled op.
   Operation *innerOp = outerRes->tiledOps.front();
+  Location loc = innerOp->getLoc();
+  int64_t mr = mK.nrows;
+  int64_t nr = mK.ncols;
+
+	  // Grab original A/B from the inner tiled ops
+  Value A = innerOp->getOperand(0);
+
+  // Try to hoist A's slice outside the innermost N-loop and decide IPs.
+  Operation *afterA = nullptr;
+  Operation *beforeA = innerOp;
+
+  // Expect localResults[5] to be the innermost scf.for (as produced by tiling).
+  if (outerRes->loops.size() > 2) {
+    if (auto innerFor = dyn_cast_or_null<scf::ForOp>(outerRes->loops[1].getOperation())) {
+      if (auto aSlice = getSliceProducerOrNull(A)) {
+        if (isExtractSliceInvariantToLoop(aSlice, innerFor)) {
+          // Move the slice that feeds A outside the inner loop.
+          aSlice->moveBefore(innerFor);
+          // Insert A_pack right AFTER this slice
+          afterA = aSlice.getOperation();
+        }
+      }
+    }
+  }
+
+  // Build A_pack at the chosen insertion point
+  auto aPackOr = buildAPackAt(rewriter, loc, A, mr, afterA, beforeA);
+  if (failed(aPackOr)) return failure();
+  Value aPack = aPackOr->first;
+
+
+  // auto outer2TilingInterfaceOp = dyn_cast<TilingInterface>(outer2Op);
+  // if (!outer2TilingInterfaceOp)
+  //   return transformOp->emitError("only TilingInterface ops are supported (outer2).");
+
+  // Operation *outer2Op = outerRes->tiledOps.front();
+  //
+  // SmallVector<int64_t, 3> outer2TileSz = {0, 0, ts.Nc};
+  // SmallVector<OpFoldResult> outer2TileOfr =
+  //     getAsIndexOpFoldResult(rewriter.getContext(), outer2TileSz);
+  //
+  // // Keep outer2 order (i, j) — reduction K stays as-is (no extra tiling).
+  // SmallVector<int64_t, 3> outer2Interchange = {0, 1, 2};
+  //
+  // // auto outer2TilingInterfaceOp = dyn_cast<TilingInterface>(outer2Op);
+  // // if (!outer2TilingInterfaceOp)
+  // //   return transformOp->emitError("only TilingInterface ops are supported (outer2).");
+  //
+  // scf::SCFTilingOptions outer2Opts;
+  // outer2Opts.setTileSizes(outer2TileOfr).setInterchange(outer2Interchange);
+  // outer2Opts.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
+  //
+  // rewriter.setInsertionPoint(outer2Op);
+  // FailureOr<scf::SCFTilingResult> outer2Res =
+  //     scf::tileUsingSCF(rewriter, outer2TilingInterfaceOp, outer2Opts);
+  // if (failed(outer2Res))
+  //   return transformOp->emitError("Second level tiling for GEMM failed.");
+
+  //
+  // // Build B_pack right before ukernel
+  // OpBuilder::InsertionGuard guard(rewriter);
+  // rewriter.setInsertionPoint(ukernel);
+  // auto bPackOr = buildBPackAt(rewriter, loc, B, nr);
+  // if (failed(bPackOr)) return failure();
+  // Value bPack = bPackOr->first;
+
+  // Inner level: (mr, nr) on inner tiled op.
+  // Operation *innerOp = outerRes->tiledOps.front();
 
   SmallVector<int64_t, 3> innerTileSz = {ts.mr, /*K*/ 0, ts.nr};
   SmallVector<OpFoldResult> innerTileOfr =
@@ -849,26 +915,27 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
   innerOpts.setTileSizes(innerTileOfr).setInterchange(innerInterchange);
   innerOpts.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
 
-  rewriter.setInsertionPoint(innerOp);
-  FailureOr<scf::SCFTilingResult> innerRes =
-      scf::tileUsingSCF(rewriter, innerTilingInterfaceOp, innerOpts);
-  if (failed(innerRes))
-    return transformOp->emitError("Second level tiling for GEMM failed.");
+  // rewriter.setInsertionPoint(innerOp);
+  // FailureOr<scf::SCFTilingResult> innerRes =
+  //     scf::tileUsingSCF(rewriter, innerTilingInterfaceOp, innerOpts);
+  // if (failed(innerRes))
+  //   return transformOp->emitError("Second level tiling for GEMM failed.");
 
   // Inner replace: same rule as outer.
-  if (!innerRes->loops.empty()) {
-    rewriter.replaceOp(innerTilingInterfaceOp, innerRes->loops.front()->getResults());
-  } else if (!innerRes->tiledOps.empty()) {
-    rewriter.replaceOp(innerTilingInterfaceOp, innerRes->tiledOps.front()->getResults());
-  } else {
-    rewriter.eraseOp(innerTilingInterfaceOp);
-  }
+  // if (!innerRes->loops.empty()) {
+  //   rewriter.replaceOp(innerTilingInterfaceOp, innerRes->loops.front()->getResults());
+  // } else if (!innerRes->tiledOps.empty()) {
+  //   rewriter.replaceOp(innerTilingInterfaceOp, innerRes->tiledOps.front()->getResults());
+  // } else {
+  //   rewriter.eraseOp(innerTilingInterfaceOp);
+  // }
 
   // Report back the tiled inner op + all loops (outer + inner)
-  tiledOps.push_back(innerRes->tiledOps.front());
+  // tiledOps.push_back(innerRes->tiledOps.front());
+  tiledOps.push_back(outerRes->tiledOps.front());
   for (Operation *loop : outerRes->loops) loopOps.push_back(loop);
-  for (Operation *loop : innerRes->loops) loopOps.push_back(loop);
-
+  // for (Operation *loop : innerRes->loops) loopOps.push_back(loop);
+  //
   // Collect only real ops: [tiledInnerOp, loop...];
   outResults.clear();
   if (!tiledOps.empty() && tiledOps.front())
@@ -1064,12 +1131,12 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
         return emitSilenceableError() << "Failed to apply tiling.";
 
       // First result in localResults contains the tiled uKernel
-      if (!localResults.empty() && localResults[0]) {
-        if (auto ukernel = dyn_cast<linalg::GenericOp>(localResults[0])) {
-          if (failed(packAndRetargetUkernel(rewriter, ukernel, mK, localResults)))
-            return emitSilenceableError() << "Failed to pack+retarget microkernel.";
-        }
-      }
+      // if (!localResults.empty() && localResults[0]) {
+      //   if (auto ukernel = dyn_cast<linalg::GenericOp>(localResults[0])) {
+      //     if (failed(packAndRetargetUkernel(rewriter, ukernel, mK, localResults)))
+      //       return emitSilenceableError() << "Failed to pack+retarget microkernel.";
+      //   }
+      // }
 
       // Store tiled uKernel (localResults[0])
       if (!localResults.empty() && localResults[0])

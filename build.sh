@@ -6,4 +6,4 @@ cmake -G Ninja .. \
    -DLLVM_ENABLE_LLD=ON \
    -DMLIR_DIR=$HOME/work/llvm-project/build/lib/cmake/mlir \
    -DLLVM_DIR=$HOME/work/llvm-project/build/lib/cmake/llvm
-cmake --build . --target transform-opt
+cmake --build . --target transform-opt -j$(nproc)
