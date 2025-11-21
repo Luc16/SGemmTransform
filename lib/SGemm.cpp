@@ -591,22 +591,22 @@ buildBPackAt(RewriterBase &rewriter, Location loc, Value B, int64_t nr) {
 /// Rewrite ukernel (linalg.generic) to read from A_pack / B_pack.
 /// Keeps the same output (C tile) and body (mul+add), only remaps inputs.
 static FailureOr<linalg::GenericOp>
-rewriteUkernelToUsePackedAB(RewriterBase &rewriter, linalg::GenericOp ukernel,
+rewriteGenericToUsePackedAB(RewriterBase &rewriter, linalg::GenericOp generic,
                             Value aPack, Value bPack) {
 
   MLIRContext *ctx = rewriter.getContext();
-  Location loc = ukernel.getLoc();
+  Location loc = generic.getLoc();
 
   // Old operands
-  Value oldA = ukernel.getDpsInputs()[0];
-  Value oldB = ukernel.getDpsInputs()[1];
-  Value oldC = ukernel.getDpsInits()[0];
+  Value oldA = generic.getDpsInputs()[0];
+  Value oldB = generic.getDpsInputs()[1];
+  Value oldC = generic.getDpsInits()[0];
 
   // We will keep the same iterator types and the same result tensor type as `oldC`.
   // Only the input operands A/B are swapped to read from packed tensors via new indexing maps.
   SmallVector<utils::IteratorType> iters =
-      llvm::to_vector(ukernel.getIteratorTypesArray());
-  auto oldMaps = ukernel.getIndexingMapsArray();
+      llvm::to_vector(generic.getIteratorTypesArray());
+  auto oldMaps = generic.getIndexingMapsArray();
   if (oldMaps.size() != 3)
     return failure();
 
@@ -649,7 +649,7 @@ rewriteUkernelToUsePackedAB(RewriterBase &rewriter, linalg::GenericOp ukernel,
   const int64_t mr = aPackTy.getShape().back();
   const int64_t nr = bPackTy.getShape().back();
 
-  // Build new indexing maps (dims = number of ukernel loops).
+  // Build new indexing maps (dims = number of generic loops).
   // A_pack index: ( floor(M/mr), K, M % mr )
   // B_pack index: ( K, floor(N/nr), N % nr )
   // C index    : ( M, N )
@@ -679,7 +679,7 @@ rewriteUkernelToUsePackedAB(RewriterBase &rewriter, linalg::GenericOp ukernel,
   Value outInit = oldC;
 
   // Materialize the remapped ukernel that consumes A_pack/B_pack and writes to the same C tile.
-  rewriter.setInsertionPoint(ukernel);
+  rewriter.setInsertionPoint(generic);
   auto remapped = rewriter.create<linalg::GenericOp>(
       loc,
       /*resultTensorTypes=*/TypeRange{outTy},
@@ -694,8 +694,8 @@ rewriteUkernelToUsePackedAB(RewriterBase &rewriter, linalg::GenericOp ukernel,
         b.create<linalg::YieldOp>(nloc, sum);
       });
 
-  // Replace the original ukernel with the remapped one.
-  rewriter.replaceOp(ukernel, remapped->getResults());
+  // Replace the original generic with the remapped one.
+  rewriter.replaceOp(generic, remapped->getResults());
   remapped->setAttrs({{"microkernel", rewriter.getUnitAttr()}});
   return remapped;
 
@@ -750,7 +750,7 @@ static LogicalResult packAndRetargetUkernel(RewriterBase &rewriter,
   Value bPack = bPackOr->first;
 
   // Rewrite ukernel to read from packed A/B and keep C intact
-  auto newUkernelOr = rewriteUkernelToUsePackedAB(rewriter, ukernel, aPack, bPack);
+  auto newUkernelOr = rewriteGenericToUsePackedAB(rewriter, ukernel, aPack, bPack);
   if (failed(newUkernelOr)) return failure();
 
   linalg::GenericOp newUkernel = *newUkernelOr;
@@ -830,17 +830,17 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
     rewriter.eraseOp(tilingInterfaceOp);
   }
 
-  Operation *innerOp = outerRes->tiledOps.front();
-  Location loc = innerOp->getLoc();
+  Operation *outer2Op = outerRes->tiledOps.front();
+  Location loc = outer2Op->getLoc();
   int64_t mr = mK.nrows;
   int64_t nr = mK.ncols;
 
 	  // Grab original A/B from the inner tiled ops
-  Value A = innerOp->getOperand(0);
+  Value A = outer2Op->getOperand(0);
 
   // Try to hoist A's slice outside the innermost N-loop and decide IPs.
   Operation *afterA = nullptr;
-  Operation *beforeA = innerOp;
+  Operation *beforeA = outer2Op;
 
   // Expect localResults[5] to be the innermost scf.for (as produced by tiling).
   if (outerRes->loops.size() > 2) {
@@ -861,8 +861,6 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
   if (failed(aPackOr)) return failure();
   Value aPack = aPackOr->first;
 
-
-  Operation *outer2Op = outerRes->tiledOps.front();
 
   auto outer2TilingInterfaceOp = dyn_cast<TilingInterface>(outer2Op);
   if (!outer2TilingInterfaceOp)
@@ -899,17 +897,39 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
     rewriter.eraseOp(outer2TilingInterfaceOp);
   }
 
+  Operation *innerOp = outer2Res->tiledOps.front();
+  Location innerLoc = innerOp->getLoc();
+
+
+  Value B = innerOp->getOperand(1);
+
+  // Build B_pack right before ukernel
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(innerOp);
+  auto bPackOr = buildBPackAt(rewriter, innerLoc, B, nr);
+  if (failed(bPackOr)) return failure();
+  Value bPack = bPackOr->first;
+
+  // rewriter.modifyOpInPlace(innerOp, [&]() {
+  //  // Operand 0 is A, Operand 1 is B. 
+  //  // We replace them with the packed versions.
+  //  innerOp->setOperand(0, aPack);
+  //  innerOp->setOperand(1, bPack);
+  // });
   //
-  // // Build B_pack right before ukernel
-  // OpBuilder::InsertionGuard guard(rewriter);
-  // rewriter.setInsertionPoint(ukernel);
-  // auto bPackOr = buildBPackAt(rewriter, loc, B, nr);
-  // if (failed(bPackOr)) return failure();
-  // Value bPack = bPackOr->first;
+
+  auto newInnerOr = rewriteGenericToUsePackedAB(rewriter, cast<linalg::GenericOp>(innerOp), aPack, bPack);
+  if (failed(newInnerOr)) return failure();
+
+  linalg::GenericOp newInnerOp = *newInnerOr;
+  newInnerOp->setAttrs({{"macrokernel", rewriter.getUnitAttr()}});
+  // if (!localResults.empty())
+  //   localResults[0] = newInnerOp.getOperation();
+
+  linalg::GenericOp newInnerGeneric = *newInnerOr;
+  innerOp = newInnerGeneric.getOperation();
 
   // Inner level: (mr, nr) on inner tiled op.
-  // Operation *innerOp = outerRes->tiledOps.front();
-
   SmallVector<int64_t, 3> innerTileSz = {ts.mr, /*K*/ 0, ts.nr};
   SmallVector<OpFoldResult> innerTileOfr =
       getAsIndexOpFoldResult(rewriter.getContext(), innerTileSz);
@@ -925,26 +945,27 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
   innerOpts.setTileSizes(innerTileOfr).setInterchange(innerInterchange);
   innerOpts.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
 
-  // rewriter.setInsertionPoint(innerOp);
-  // FailureOr<scf::SCFTilingResult> innerRes =
-  //     scf::tileUsingSCF(rewriter, innerTilingInterfaceOp, innerOpts);
-  // if (failed(innerRes))
-  //   return transformOp->emitError("Second level tiling for GEMM failed.");
+  rewriter.setInsertionPoint(innerOp);
+  FailureOr<scf::SCFTilingResult> innerRes =
+      scf::tileUsingSCF(rewriter, innerTilingInterfaceOp, innerOpts);
+  if (failed(innerRes))
+    return transformOp->emitError("Second level tiling for GEMM failed.");
 
   // Inner replace: same rule as outer.
-  // if (!innerRes->loops.empty()) {
-  //   rewriter.replaceOp(innerTilingInterfaceOp, innerRes->loops.front()->getResults());
-  // } else if (!innerRes->tiledOps.empty()) {
-  //   rewriter.replaceOp(innerTilingInterfaceOp, innerRes->tiledOps.front()->getResults());
-  // } else {
-  //   rewriter.eraseOp(innerTilingInterfaceOp);
-  // }
+  if (!innerRes->loops.empty()) {
+    rewriter.replaceOp(innerTilingInterfaceOp, innerRes->loops.front()->getResults());
+  } else if (!innerRes->tiledOps.empty()) {
+    rewriter.replaceOp(innerTilingInterfaceOp, innerRes->tiledOps.front()->getResults());
+  } else {
+    rewriter.eraseOp(innerTilingInterfaceOp);
+  }
 
   // Report back the tiled inner op + all loops (outer + inner)
-  // tiledOps.push_back(innerRes->tiledOps.front());
-  tiledOps.push_back(outerRes->tiledOps.front());
+  tiledOps.push_back(innerRes->tiledOps.front());
+  // tiledOps.push_back(outer2Res->tiledOps.front());
   for (Operation *loop : outerRes->loops) loopOps.push_back(loop);
-  // for (Operation *loop : innerRes->loops) loopOps.push_back(loop);
+  for (Operation *loop : outer2Res->loops) loopOps.push_back(loop);
+  for (Operation *loop : innerRes->loops) loopOps.push_back(loop);
   //
   // Collect only real ops: [tiledInnerOp, loop...];
   outResults.clear();
