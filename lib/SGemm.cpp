@@ -910,21 +910,11 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
   if (failed(bPackOr)) return failure();
   Value bPack = bPackOr->first;
 
-  // rewriter.modifyOpInPlace(innerOp, [&]() {
-  //  // Operand 0 is A, Operand 1 is B. 
-  //  // We replace them with the packed versions.
-  //  innerOp->setOperand(0, aPack);
-  //  innerOp->setOperand(1, bPack);
-  // });
-  //
-
   auto newInnerOr = rewriteGenericToUsePackedAB(rewriter, cast<linalg::GenericOp>(innerOp), aPack, bPack);
   if (failed(newInnerOr)) return failure();
 
   linalg::GenericOp newInnerOp = *newInnerOr;
   newInnerOp->setAttrs({{"macrokernel", rewriter.getUnitAttr()}});
-  // if (!localResults.empty())
-  //   localResults[0] = newInnerOp.getOperation();
 
   linalg::GenericOp newInnerGeneric = *newInnerOr;
   innerOp = newInnerGeneric.getOperation();
