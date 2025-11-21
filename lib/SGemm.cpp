@@ -862,32 +862,42 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
   Value aPack = aPackOr->first;
 
 
+  Operation *outer2Op = outerRes->tiledOps.front();
+
+  auto outer2TilingInterfaceOp = dyn_cast<TilingInterface>(outer2Op);
+  if (!outer2TilingInterfaceOp)
+    return transformOp->emitError("only TilingInterface ops are supported (outer2).");
+
+  SmallVector<int64_t, 3> outer2TileSz = {0, 0, ts.Nc};
+  SmallVector<OpFoldResult> outer2TileOfr =
+      getAsIndexOpFoldResult(rewriter.getContext(), outer2TileSz);
+
+  // Keep outer2 order (i, j) — reduction K stays as-is (no extra tiling).
+  SmallVector<int64_t, 3> outer2Interchange = {0, 1, 2};
+
   // auto outer2TilingInterfaceOp = dyn_cast<TilingInterface>(outer2Op);
   // if (!outer2TilingInterfaceOp)
   //   return transformOp->emitError("only TilingInterface ops are supported (outer2).");
 
-  // Operation *outer2Op = outerRes->tiledOps.front();
-  //
-  // SmallVector<int64_t, 3> outer2TileSz = {0, 0, ts.Nc};
-  // SmallVector<OpFoldResult> outer2TileOfr =
-  //     getAsIndexOpFoldResult(rewriter.getContext(), outer2TileSz);
-  //
-  // // Keep outer2 order (i, j) — reduction K stays as-is (no extra tiling).
-  // SmallVector<int64_t, 3> outer2Interchange = {0, 1, 2};
-  //
-  // // auto outer2TilingInterfaceOp = dyn_cast<TilingInterface>(outer2Op);
-  // // if (!outer2TilingInterfaceOp)
-  // //   return transformOp->emitError("only TilingInterface ops are supported (outer2).");
-  //
-  // scf::SCFTilingOptions outer2Opts;
-  // outer2Opts.setTileSizes(outer2TileOfr).setInterchange(outer2Interchange);
-  // outer2Opts.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
-  //
-  // rewriter.setInsertionPoint(outer2Op);
-  // FailureOr<scf::SCFTilingResult> outer2Res =
-  //     scf::tileUsingSCF(rewriter, outer2TilingInterfaceOp, outer2Opts);
-  // if (failed(outer2Res))
-  //   return transformOp->emitError("Second level tiling for GEMM failed.");
+  scf::SCFTilingOptions outer2Opts;
+  outer2Opts.setTileSizes(outer2TileOfr).setInterchange(outer2Interchange);
+  outer2Opts.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
+
+  rewriter.setInsertionPoint(outer2Op);
+  FailureOr<scf::SCFTilingResult> outer2Res =
+      scf::tileUsingSCF(rewriter, outer2TilingInterfaceOp, outer2Opts);
+  if (failed(outer2Res))
+    return transformOp->emitError("Second level tiling for GEMM failed.");
+
+
+  // Outer 2 replace: same rule as outer.
+  if (!outer2Res->loops.empty()) {
+    rewriter.replaceOp(outer2TilingInterfaceOp, outer2Res->loops.front()->getResults());
+  } else if (!outer2Res->tiledOps.empty()) {
+    rewriter.replaceOp(outer2TilingInterfaceOp, outer2Res->tiledOps.front()->getResults());
+  } else {
+    rewriter.eraseOp(outer2TilingInterfaceOp);
+  }
 
   //
   // // Build B_pack right before ukernel
