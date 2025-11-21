@@ -914,7 +914,7 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
   if (failed(newInnerOr)) return failure();
 
   linalg::GenericOp newInnerOp = *newInnerOr;
-  newInnerOp->setAttrs({{"macrokernel", rewriter.getUnitAttr()}});
+  newInnerOp->setAttrs({{"microkernel", rewriter.getUnitAttr()}});
 
   linalg::GenericOp newInnerGeneric = *newInnerOr;
   innerOp = newInnerGeneric.getOperation();
