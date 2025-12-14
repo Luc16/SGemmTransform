@@ -22,4 +22,5 @@ add_mlir_library(
   MLIRFuncDialect
   MLIRSCFDialect
   MLIRAffineDialect
+  MLIRVectorDialect
 )

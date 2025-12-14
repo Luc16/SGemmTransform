@@ -8,6 +8,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Builders.h"
@@ -67,6 +68,7 @@ void SGemm::init() {
   declareGeneratedDialect<index::IndexDialect>();
   declareGeneratedDialect<scf::SCFDialect>();
   declareGeneratedDialect<tensor::TensorDialect>();
+	declareGeneratedDialect<vector::VectorDialect>();
   declareGeneratedDialect<LLVM::LLVMDialect>();
 
   // Finally, we register the additional transform operations with the dialect.
@@ -120,6 +122,13 @@ static Value buildMul(OpBuilder &b, Location loc, Value a, int64_t cst) {
 /// Get `tensor.dim` as index value for ranked tensors.
 static Value dimAsIndex(OpBuilder &b, Location loc, Value tensor, int64_t d) {
   return b.create<tensor::DimOp>(loc, tensor, d);
+}
+
+
+mKInfo findUkernelDimensions(uint8_t aBitWidth) {
+	uint8_t nrows = 6;
+	uint8_t ncols = 16*32 / aBitWidth; // Adjust columns based on datatype size
+	return {nrows, ncols, static_cast<uint16_t>(nrows * ncols)};
 }
 
 /// Pad `tensor` so that selected dimensions become multiples of the given `multiples`.
@@ -761,6 +770,132 @@ static LogicalResult packAndRetargetUkernel(RewriterBase &rewriter,
   return success();
 }
 
+static LogicalResult generateOptmizedUkernel(RewriterBase &rewriter,
+                                            linalg::GenericOp ukernel,
+                                            const mKInfo &mK,
+                                            const ArchInfo &arch, 
+                                            SmallVector<Operation*, 6> &resultOps) {
+
+	const int64_t kUnroll = 4;
+
+	OpBuilder::InsertionGuard guard(rewriter);
+	rewriter.setInsertionPoint(ukernel);
+	Location loc = ukernel.getLoc();
+
+	Value A = ukernel.getInputs()[0];
+	Value B = ukernel.getInputs()[1];
+	Value C_init = ukernel.getOutputs()[0];
+
+	Value K_dim = rewriter.create<tensor::DimOp>(loc, A, 1);
+
+	// get ukernel datatype sizes
+    auto shapedTypeA = dyn_cast<ShapedType>(A.getType());
+    Type aType = shapedTypeA.getElementType();
+	uint8_t aBitWidth = aType.getIntOrFloatBitWidth();
+
+	// I case we need it in the future (for mixed precision ukernels)
+	// auto shapedTypeB = B.getType().cast<ShapedType>();
+	// Type bType = shapedTypeB.getElementType();
+	// uint8_t bBitWidth = bType.getIntOrFloatBitWidth();
+	//
+	// auto shapedTypeC = C_init.getType().cast<ShapedType>();
+	// Type cType = shapedTypeC.getElementType();
+	// uint8_t cBitWidth = cType.getIntOrFloatBitWidth();
+
+    
+	mKInfo ukDim = findUkernelDimensions(aBitWidth);
+
+	// Constants
+	Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+	Value step = rewriter.create<arith::ConstantIndexOp>(loc, kUnroll);
+
+	Value zeroVal;
+	if (isa<IntegerType>(aType)) {
+		zeroVal = rewriter.create<arith::ConstantOp>(loc, aType, rewriter.getIntegerAttr(aType, 0));
+	} else {
+		zeroVal = rewriter.create<arith::ConstantOp>(loc, aType, rewriter.getFloatAttr(aType, 0.0));
+	}
+
+
+	// Vector Types
+	VectorType vecRowTy = VectorType::get({ukDim.ncols}, aType);
+
+	SmallVector<Value> accVars;
+	SmallVector<bool> inBoundsRow(1, true); // Rank 1 = 1 bool
+
+	for (int i = 0; i < ukDim.nrows; ++i) {
+		Value iIdx = rewriter.create<arith::ConstantIndexOp>(loc, i);
+		Value acc = rewriter.create<vector::TransferReadOp>(
+				loc, vecRowTy, C_init, ValueRange{iIdx, c0}, zeroVal, 
+				inBoundsRow);
+		accVars.push_back(acc);
+	}
+
+	// 2. Main Loop
+	auto loop = rewriter.create<scf::ForOp>(loc, c0, K_dim, step, accVars);
+
+	{
+		OpBuilder::InsertionGuard loopGuard(rewriter);
+		rewriter.setInsertionPointToStart(loop.getBody());
+
+		Value k_base = loop.getInductionVar();
+
+		SmallVector<Value> currentAccs;
+		for (Value arg : loop.getRegionIterArgs()) currentAccs.push_back(arg);
+
+		// Inner Unroll Loop (Iterates 4 times)
+		for (int u = 0; u < kUnroll; ++u) {
+			Value uIdx = rewriter.create<arith::ConstantIndexOp>(loc, u);
+			Value k = rewriter.create<arith::AddIOp>(loc, k_base, uIdx);
+
+			// A. Load B Row [k, 0...15]
+			// Uses 2 YMM registers (ymm0-ymm1).
+			Value bRow = rewriter.create<vector::TransferReadOp>(
+					loc, vecRowTy, B, ValueRange{k, c0, c0}, zeroVal, 
+					inBoundsRow);
+
+			// B. Interleaved Load/Broadcast/FMA for A
+			// We iterate M by 2 to encourage pairing, though LLVM scheduler handles this.
+			for (int m = 0; m < ukDim.nrows; ++m) {
+				Value mIdx = rewriter.create<arith::ConstantIndexOp>(loc, m);
+
+				Value aScalar = rewriter.create<tensor::ExtractOp>(
+						loc, A, ValueRange{c0, k, mIdx});
+
+				Value aBcast = rewriter.create<vector::BroadcastOp>(
+						loc, vecRowTy, aScalar);
+
+				// FMA: Acc[m] += A_bcast * B_row
+				currentAccs[m] = rewriter.create<vector::FMAOp>(
+						loc, aBcast, bRow, currentAccs[m]);
+			}
+		}
+
+		rewriter.create<scf::YieldOp>(loc, currentAccs);
+	}
+
+	// 3. Write Back
+	Value finalTensor = C_init;
+	for (int i = 0; i < ukDim.nrows; ++i) {
+		Value iIdx = rewriter.create<arith::ConstantIndexOp>(loc, i);
+		Value finalVal = loop.getResult(i);
+
+		finalTensor = rewriter.create<vector::TransferWriteOp>(
+				loc, finalVal, finalTensor, ValueRange{iIdx, c0}, 
+				inBoundsRow).getResult();
+	}
+
+	ukernel->getResult(0).replaceAllUsesWith(finalTensor);
+	ukernel->erase();
+
+	// resultOps.push_back(finalTensor.getDefiningOp());
+  resultOps[0] = finalTensor.getDefiningOp();
+  
+
+	return success();
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // Tiling Helpers
 //===----------------------------------------------------------------------===//
@@ -777,9 +912,14 @@ static GemmTileSizes computeGemmTiles(const mKInfo &mK, const ArchInfo &arch) {
   ts.nr = std::max<int64_t>(mK.ncols, 8); // e.g., 8..32
 
   // Outer: pick Mc/Nc as a few microkernels; Kc as a reduction chunk.
-  ts.Mc = ts.mr * 8;         // 8 microkernels stacked on M
-  ts.Nc = ts.nr * 4;         // 4 microkernels stacked on N
-  ts.Kc = 128;               // conservative reduction chunk (tune by arch)
+  // ts.Mc = ts.mr * 8;         // 8 microkernels stacked on M
+  // ts.Nc = ts.nr * 4;         // 4 microkernels stacked on N
+  // ts.Kc = 128;               // conservative reduction chunk (tune by arch)
+
+  // Parameters i got from BLIS in Intel Haswell
+  ts.Nc = 144;
+  ts.Kc = 256;
+  ts.Mc = 4080;
 
   // We can refine later with arch.l2_size (VTCM-size ?).
   (void)arch;
@@ -1051,7 +1191,7 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
   };
 
   // Get the optional arguments
-  auto mKInfoAttr = getMKInfo();
+  auto mKInfoAttr = getMKInfo(); // This will be useless in the future, as micro-kernel sizes will be problem/arch dependent.
   auto archInfoAttr = getArchInfo();
 
   // If `mKInfoAttr` was provided, use the given values
@@ -1108,6 +1248,15 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
       if (failed(res))
         return emitSilenceableError() << "failed to generalize linalg.matmul";
 
+      
+      Value A = mm.getInputs()[0];
+      // get ukernel datatype sizes
+      auto shapedTypeA = dyn_cast<ShapedType>(A.getType());
+      Type aType = shapedTypeA.getElementType();
+      uint8_t aBitWidth = aType.getIntOrFloatBitWidth();
+
+      mK = findUkernelDimensions(aBitWidth);
+
       linalg::GenericOp genericOp = *res;
       // Compute tile sizes once (we need them for padding multiples).
       GemmTileSizes ts = computeGemmTiles(mK, arch);
@@ -1152,12 +1301,15 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
         return emitSilenceableError() << "Failed to apply tiling.";
 
       // First result in localResults contains the tiled uKernel
-      // if (!localResults.empty() && localResults[0]) {
-      //   if (auto ukernel = dyn_cast<linalg::GenericOp>(localResults[0])) {
-      //     if (failed(packAndRetargetUkernel(rewriter, ukernel, mK, localResults)))
-      //       return emitSilenceableError() << "Failed to pack+retarget microkernel.";
-      //   }
-      // }
+      if (!localResults.empty() && localResults[0]) {
+        if (auto ukernel = dyn_cast<linalg::GenericOp>(localResults[0])) {
+          if (failed(generateOptmizedUkernel(rewriter, ukernel, mK, arch, localResults)))
+            return emitSilenceableError() << "Failed to generate microkernel.";
+          
+          // if (failed(packAndRetargetUkernel(rewriter, ukernel, mK, localResults)))
+          //   return emitSilenceableError() << "Failed to pack+retarget microkernel.";
+        }
+      }
 
       // Store tiled uKernel (localResults[0])
       if (!localResults.empty() && localResults[0])
