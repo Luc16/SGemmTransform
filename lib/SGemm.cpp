@@ -455,7 +455,7 @@ computeAPackedType(RankedTensorType aType, int64_t mr) {
   return RankedTensorType::get(newShape, aType.getElementType());
 }
 
-/// Compute packed type for B: from [Kc, Nc] to [Kc, Nc/nr, nr].
+/// Compute packed type for B: from [Kc, Nc] to [Nc/nr, Kc, nr].
 static RankedTensorType
 computeBPackedType(RankedTensorType bType, int64_t nr) {
   auto shape = bType.getShape();
@@ -467,7 +467,7 @@ computeBPackedType(RankedTensorType bType, int64_t nr) {
     return ShapedType::isDynamic(d) ? ShapedType::kDynamic : (d / c);
   };
 
-  SmallVector<int64_t, 3> newShape = {Kc, divOrDyn(Nc, nr), nr};
+  SmallVector<int64_t, 3> newShape = {divOrDyn(Nc, nr), Kc, nr};
   return RankedTensorType::get(newShape, bType.getElementType());
 }
 
@@ -484,7 +484,7 @@ static void buildAPackMaps(MLIRContext *ctx, int64_t mr,
   outMap = AffineMap::get(/*dims=*/2, /*symbols=*/0, ArrayRef<AffineExpr>{io, k, ii}, ctx);
 }
 
-/// Build affine maps for B-pack:  in:  (k,j)  -> out: (k, jo, ji)
+/// Build affine maps for B-pack:  in:  (k,j)  -> out: (k, ji)
 /// with jo=floor(j/nr), ji=mod(j,nr)
 static void buildBPackMaps(MLIRContext *ctx, int64_t nr,
                            AffineMap &inMap, AffineMap &outMap) {
@@ -494,7 +494,7 @@ static void buildBPackMaps(MLIRContext *ctx, int64_t nr,
   AffineExpr jo = j.floorDiv(nr);
   AffineExpr ji = j % nr;
   inMap  = AffineMap::get(/*dims=*/2, /*symbols=*/0, ArrayRef<AffineExpr>{k, j}, ctx);
-  outMap = AffineMap::get(/*dims=*/2, /*symbols=*/0, ArrayRef<AffineExpr>{k, jo, ji}, ctx);
+  outMap = AffineMap::get(/*dims=*/2, /*symbols=*/0, ArrayRef<AffineExpr>{jo, k, ji}, ctx);
 }
 
 /// Build A_pack at a precise insertion point. If `afterOp` != nullptr,
@@ -570,16 +570,16 @@ buildBPackAt(RewriterBase &rewriter, Location loc, Value B, int64_t nr) {
 
   SmallVector<Value> dynSizesForBPack;
   if (ShapedType::isDynamic(bPackTy.getDimSize(0))) {
-    // dim 0 of B_pack is Kc. Reuse tile K from B tile dim[0].
-    Value kc = getDimValueFor(rewriter, loc, /*bLocal=*/B, /*dim=*/0);
-    dynSizesForBPack.push_back(kc);
-  }
-  if (ShapedType::isDynamic(bPackTy.getDimSize(1))) {
-    // dim 1 of B_pack is Nc/nr. Compute Nc from B tile dim[1] and divide by nr.
+    // dim 0 of B_pack is Nc/nr. Compute Nc from B tile dim[1].
     Value nc  = getDimValueFor(rewriter, loc, /*bLocal=*/B, /*dim=*/1);
     Value cNr = rewriter.create<arith::ConstantIndexOp>(loc, nr);
     Value ncDr= rewriter.create<arith::DivSIOp>(loc, nc, cNr);
     dynSizesForBPack.push_back(ncDr);
+  }
+  if (ShapedType::isDynamic(bPackTy.getDimSize(1))) {
+    // dim 1 of B_pack is Kc. Reuse tile K from B tile dim[0].
+    Value kc = getDimValueFor(rewriter, loc, /*bLocal=*/B, /*dim=*/0);
+    dynSizesForBPack.push_back(kc);
   }
 
   // Create empty for B_pack providing dynamic sizes only for '?' dims.
@@ -679,7 +679,7 @@ rewriteGenericToUsePackedAB(RewriterBase &rewriter, linalg::GenericOp generic,
   AffineMap aPackMap = AffineMap::get(/*dims=*/iters.size(), /*symbols=*/0,
                                       ArrayRef<AffineExpr>{io, K, ii}, ctx);
   AffineMap bPackMap = AffineMap::get(/*dims=*/iters.size(), /*symbols=*/0,
-                                      ArrayRef<AffineExpr>{K, jo, ji}, ctx);
+                                      ArrayRef<AffineExpr>{jo, K, ji}, ctx);
   AffineMap cMap     = AffineMap::get(/*dims=*/iters.size(), /*symbols=*/0,
                                       ArrayRef<AffineExpr>{M, N}, ctx);
 
@@ -851,7 +851,7 @@ static LogicalResult generateOptmizedUkernel(RewriterBase &rewriter,
 			// A. Load B Row [k, 0...15]
 			// Uses 2 YMM registers (ymm0-ymm1).
 			Value bRow = rewriter.create<vector::TransferReadOp>(
-					loc, vecRowTy, B, ValueRange{k, c0, c0}, zeroVal, 
+					loc, vecRowTy, B, ValueRange{c0, k, c0}, zeroVal, 
 					inBoundsRow);
 
 			// B. Interleaved Load/Broadcast/FMA for A
@@ -893,7 +893,6 @@ static LogicalResult generateOptmizedUkernel(RewriterBase &rewriter,
   
 
 	return success();
-  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -918,7 +917,7 @@ static GemmTileSizes computeGemmTiles(const mKInfo &mK, const ArchInfo &arch) {
 
   // Parameters i got from BLIS in Intel Haswell
   ts.Nc = 144;
-  ts.Kc = 256;
+  ts.Kc = 512;
   ts.Mc = 4080;
 
   // We can refine later with arch.l2_size (VTCM-size ?).
