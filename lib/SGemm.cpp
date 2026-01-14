@@ -831,6 +831,8 @@ static LogicalResult generateOptmizedUkernel(RewriterBase &rewriter,
 		accVars.push_back(acc);
 	}
 
+	// Prefetching could be added here
+	
 	// 2. Main Loop
 	auto loop = rewriter.create<scf::ForOp>(loc, c0, K_dim, step, accVars);
 
@@ -917,7 +919,7 @@ static GemmTileSizes computeGemmTiles(const mKInfo &mK, const ArchInfo &arch) {
 
   // Parameters i got from BLIS in Intel Haswell
   ts.Nc = 144;
-  ts.Kc = 512;
+  ts.Kc = 256;
   ts.Mc = 4080;
 
   // We can refine later with arch.l2_size (VTCM-size ?).
