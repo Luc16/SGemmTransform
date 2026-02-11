@@ -169,11 +169,15 @@ typedef struct {
   uint32_t l1_size;
   uint32_t l2_size;
   uint32_t l3_size;
+  uint32_t vec_len; // In bits
+  uint32_t num_vecs; // Number of vector registers  
+  uint32_t is_risc;
 } ArchInfo;
 
 typedef struct {
   uint8_t nrows;
   uint8_t ncols;
+  uint8_t unroll;
   uint16_t noutput;
 } mKInfo;
 
@@ -184,6 +188,10 @@ struct GemmTileSizes {
   int64_t Mc = 0, Kc = 0, Nc = 0;
   // Inner tiles (micro-kernel)
   int64_t mr = 0, nr = 0;
+};
+
+struct GemmOriginalSizes {
+	int64_t M = 0, K = 0, N = 0;
 };
 
 enum class PadNeed { None, Needed, Maybe };

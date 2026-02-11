@@ -13,6 +13,8 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/MLIRContext.h"
+
+
 #include "mlir/IR/Location.h"
 #include "mlir/IR/Value.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -20,8 +22,6 @@
 #include "mlir/IR/AffineMap.h"
 #include "llvm/ADT/SmallVector.h"
 
-#include "mlir/IR/DialectImplementation.h"
-#include "mlir/Interfaces/CallInterfaces.h"
 
 using namespace mlir;
 using namespace mlir::affine;
@@ -124,11 +124,15 @@ static Value dimAsIndex(OpBuilder &b, Location loc, Value tensor, int64_t d) {
   return b.create<tensor::DimOp>(loc, tensor, d);
 }
 
+static int64_t roundUp(int64_t size, int64_t multiple) {
+    if (size == ShapedType::kDynamic) return ShapedType::kDynamic;
+    return ((size + multiple - 1) / multiple) * multiple;
+}
 
 mKInfo findUkernelDimensions(uint8_t aBitWidth) {
 	uint8_t nrows = 6;
 	uint8_t ncols = 16*32 / aBitWidth; // Adjust columns based on datatype size
-	return {nrows, ncols, static_cast<uint16_t>(nrows * ncols)};
+	return {nrows, ncols, 4, static_cast<uint16_t>(nrows * ncols)};
 }
 
 /// Pad `tensor` so that selected dimensions become multiples of the given `multiples`.
@@ -264,7 +268,7 @@ static PadNeed needsPaddingToMultiples(RankedTensorType rtt,
 static FailureOr<MaybePaddedABC>
 preparePaddingForGemmLike(RewriterBase &rewriter,
                           linalg::GenericOp gemmLike,
-                          const GemmTileSizes &ts) {
+                          GemmTileSizes ts) {
 
   if (!gemmLike) return failure();
   Location loc = gemmLike.getLoc();
@@ -406,6 +410,45 @@ static Value getDimValueFor(OpBuilder &rewriter, Location loc, Value tensor, int
 // Packing helpers (row-panel for A, col-panel for B)
 //===----------------------------------------------------------------------===//
 
+static Value padTileToStaticShape(RewriterBase &rewriter, Location loc, Value tile, ArrayRef<int64_t> targetShape) {
+
+	auto tileType = dyn_cast<RankedTensorType>(tile.getType());
+	if (tileType.getShape() == targetShape) return tile; // no-op: already the right shape
+
+	// Pad the tile to the target shape using tensor.pad with zero padding.
+	auto zero = buildZeroLike(rewriter, loc, tileType.getElementType());
+
+	SmallVector<OpFoldResult> lowPads(tileType.getRank(), rewriter.getIndexAttr(0));
+	SmallVector<OpFoldResult> highPads;
+
+	for (int i = 0; i < targetShape.size(); ++i) {
+		int64_t targetSize = targetShape[i];
+
+		Value curDim = rewriter.create<tensor::DimOp>(loc, tile, i);
+		Value targetSizeV = rewriter.create<arith::ConstantIndexOp>(loc, targetSize);
+		Value highPad = rewriter.create<arith::SubIOp>(loc, targetSizeV, curDim);
+		highPads.push_back(highPad);
+	}
+
+	auto paddedTile = rewriter.create<tensor::PadOp>(
+			loc,
+			/*resultType=*/RankedTensorType::get(targetShape, tileType.getElementType()),
+			tile, lowPads, highPads, false);
+	{
+		OpBuilder::InsertionGuard guard(rewriter);
+		Block *body = rewriter.createBlock(&paddedTile.getRegion());
+		int64_t rank = tileType.getRank();
+		for (int64_t d = 0; d < rank; ++d)
+			body->addArgument(rewriter.getIndexType(), loc);
+
+		// Yield zero as the padding value.
+		Value zero = buildZeroLike(rewriter, loc, tileType.getElementType());
+		rewriter.create<tensor::YieldOp>(loc, zero);
+	}
+
+	return paddedTile.getResult();
+};
+
 /// Return the ExtractSliceOp that ultimately produces `v`, or null if none.
 static tensor::ExtractSliceOp getSliceProducerOrNull(Value v) {
   Value cur = v;
@@ -502,11 +545,11 @@ static void buildBPackMaps(MLIRContext *ctx, int64_t nr,
 /// in  : A tile type [Mc, Kc]
 /// out : A_pack type [Mc/mr, Kc, mr]
 static FailureOr<std::pair<Value, RankedTensorType>>
-buildAPackAt(RewriterBase &rewriter, Location loc, Value A, int64_t mr,
+buildAPackAt(RewriterBase &rewriter, Location loc, Value A, 
+    GemmOriginalSizes origSizes, GemmTileSizes ts, mKInfo mK,
              Operation *afterOp, Operation *beforeOp) {
 
   OpBuilder::InsertionGuard g(rewriter);
-
   if (afterOp) {
     rewriter.setInsertionPointAfter(afterOp);
   } else if (beforeOp) {
@@ -517,34 +560,26 @@ buildAPackAt(RewriterBase &rewriter, Location loc, Value A, int64_t mr,
 
   // aType is the rank-2 tile of A: tensor<?xKc> in the tail case.
   auto aType = dyn_cast<RankedTensorType>(A.getType());
-  if (!aType || aType.getRank() != 2) return failure();
+  if (!aType) return failure();
 
-  // Compute the packed type: [Mc/mr, Kc, mr] with dynamic dims propagated.
-  auto aPackTy = computeAPackedType(aType, mr);
+  int64_t pKc = (origSizes.K > ts.Kc) ? ts.Kc : origSizes.K; // handle Kc tail case with smaller reduction size
+  int64_t pMc = (origSizes.M > ts.Mc) ? ts.Mc : origSizes.M; // handle Mc tail case by rounding up to next multiple of mr
+  pKc = roundUp(pKc, mK.unroll); // ensure Kc is a multiple of mK.ncols for the packing math to work out
+  pMc = roundUp(pMc, mK.nrows); // ensure Mc is a multiple of mK.nrows for the packing math to work out
+
+  Value paddedA = padTileToStaticShape(rewriter, loc, A, {pMc, pKc});
+
+  SmallVector<int64_t> targetShape = {pMc/mK.nrows, pKc, mK.nrows};
+  auto aPackTy = RankedTensorType::get(targetShape, aType.getElementType());
+
   AffineMap aInMap, aOutMap;
-  buildAPackMaps(rewriter.getContext(), mr, aInMap, aOutMap);
+  buildAPackMaps(rewriter.getContext(), mK.nrows, aInMap, aOutMap);
 
-  // Build dynamic size operands for dynamic dims of aPackTy, in rank order.
-  // aType is the tile type of A (rank-2). `A` is the tile value (extract_slice result).
-  SmallVector<Value> dynSizesForAPack;
-  if (ShapedType::isDynamic(aPackTy.getDimSize(0))) {
-    // dim 0 of A_pack is Mc/mr. Get Mc from A tile dim[0] and divide by mr.
-    Value mc   = getDimValueFor(rewriter, loc, /*aLocal=*/A, /*dim=*/0);
-    Value cMr  = rewriter.create<arith::ConstantIndexOp>(loc, mr);
-    Value mcDr = rewriter.create<arith::DivSIOp>(loc, mc, cMr);
-    dynSizesForAPack.push_back(mcDr);
-  }
-  if (ShapedType::isDynamic(aPackTy.getDimSize(1))) {
-    // dim 1 of A_pack is Kc (tile K). Reuse tile K from A tile dim[1].
-    Value kc = getDimValueFor(rewriter, loc, /*aLocal=*/A, /*dim=*/1);
-    dynSizesForAPack.push_back(kc);
-  }
-
-  // Create empty for A_pack providing dynamic sizes only for '?' dims.
-  Value aEmpty = buildEmptyForType(rewriter, loc, aPackTy, dynSizesForAPack);
+  Value aEmpty = rewriter.create<tensor::EmptyOp>(
+	  loc, targetShape, aPackTy.getElementType());
 
   auto aPack = rewriter.create<linalg::GenericOp>(
-      loc, TypeRange{aPackTy}, ValueRange{A}, ValueRange{aEmpty},
+      loc, TypeRange{aPackTy}, ValueRange{paddedA}, ValueRange{aEmpty},
       ArrayRef<AffineMap>{aInMap, aOutMap},
       SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
                                        utils::IteratorType::parallel},
@@ -559,34 +594,29 @@ buildAPackAt(RewriterBase &rewriter, Location loc, Value A, int64_t mr,
 // in  : B tile type [Kc, Nc]
 // out : B_pack type [Kc, Nc/nr, nr]
 static FailureOr<std::pair<Value, RankedTensorType>>
-buildBPackAt(RewriterBase &rewriter, Location loc, Value B, int64_t nr) {
+buildBPackAt(RewriterBase &rewriter, Location loc, Value B, GemmOriginalSizes origSizes, GemmTileSizes ts, mKInfo mK) {
 
   auto bType = dyn_cast<RankedTensorType>(B.getType());
-  if (!bType || bType.getRank() != 2) return failure();
-  auto bPackTy = computeBPackedType(bType, nr);
+  if (!bType) return failure();
+
+  int64_t pKc = (origSizes.K > ts.Kc) ? ts.Kc : origSizes.K; // handle Kc tail case with smaller reduction size
+  int64_t pNc = (origSizes.N > ts.Nc) ? ts.Nc : origSizes.N; // handle Nc tail case by rounding up to next multiple of mr
+  pKc = roundUp(pKc, mK.unroll); // ensure Kc is a multiple of mK.ncols for the packing math to work out
+  pNc = roundUp(pNc, mK.ncols); // ensure Mc is a multiple of mK.nrows for the packing math to work out
+
+  Value paddedB = padTileToStaticShape(rewriter, loc, B, {pKc, pNc});
+
+  SmallVector<int64_t> targetShape = {pNc/mK.ncols, pKc, mK.ncols};
+  auto bPackTy = RankedTensorType::get(targetShape, bType.getElementType());
 
   AffineMap bInMap, bOutMap;
-  buildBPackMaps(rewriter.getContext(), nr, bInMap, bOutMap);
+  buildBPackMaps(rewriter.getContext(), mK.ncols, bInMap, bOutMap);
 
-  SmallVector<Value> dynSizesForBPack;
-  if (ShapedType::isDynamic(bPackTy.getDimSize(0))) {
-    // dim 0 of B_pack is Nc/nr. Compute Nc from B tile dim[1].
-    Value nc  = getDimValueFor(rewriter, loc, /*bLocal=*/B, /*dim=*/1);
-    Value cNr = rewriter.create<arith::ConstantIndexOp>(loc, nr);
-    Value ncDr= rewriter.create<arith::DivSIOp>(loc, nc, cNr);
-    dynSizesForBPack.push_back(ncDr);
-  }
-  if (ShapedType::isDynamic(bPackTy.getDimSize(1))) {
-    // dim 1 of B_pack is Kc. Reuse tile K from B tile dim[0].
-    Value kc = getDimValueFor(rewriter, loc, /*bLocal=*/B, /*dim=*/0);
-    dynSizesForBPack.push_back(kc);
-  }
-
-  // Create empty for B_pack providing dynamic sizes only for '?' dims.
-  Value bEmpty = buildEmptyForType(rewriter, loc, bPackTy, dynSizesForBPack);
+  Value bEmpty = rewriter.create<tensor::EmptyOp>(
+	  loc, targetShape, bPackTy.getElementType());
 
   auto bPack = rewriter.create<linalg::GenericOp>(
-      loc, TypeRange{bPackTy}, ValueRange{B}, ValueRange{bEmpty},
+      loc, TypeRange{bPackTy}, ValueRange{paddedB}, ValueRange{bEmpty},
       ArrayRef<AffineMap>{bInMap, bOutMap},
       SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
                                        utils::IteratorType::parallel},
@@ -710,88 +740,23 @@ rewriteGenericToUsePackedAB(RewriterBase &rewriter, linalg::GenericOp generic,
 
 }
 
-/// Factor the code that, given a tiled ukernel, builds A_pack/B_pack at the
-/// right insertion points and rewrites the ukernel to consume the packed
-/// operands. Updates localResults[0] with the new ukernel.
-/// Returns success if packing+rewrite was applied.
-static LogicalResult packAndRetargetUkernel(RewriterBase &rewriter,
-                                            linalg::GenericOp ukernel,
-                                            const mKInfo &mK,
-                                            SmallVector<Operation*, 6> &localResults) {
-
-  if (!ukernel) return failure();
-  Location loc = ukernel.getLoc();
-  int64_t mr = mK.nrows;
-  int64_t nr = mK.ncols;
-
-  // Grab original A/B from the ukernel
-  Value A = ukernel.getDpsInputs()[0];
-  Value B = ukernel.getDpsInputs()[1];
-
-  // Try to hoist A's slice outside the innermost N-loop and decide IPs.
-  Operation *afterA = nullptr;
-  Operation *beforeA = ukernel.getOperation();
-
-  // Expect localResults[5] to be the innermost scf.for (as produced by tiling).
-  if (localResults.size() > 5) {
-    if (auto innerFor = dyn_cast_or_null<scf::ForOp>(localResults[5])) {
-      if (auto aSlice = getSliceProducerOrNull(A)) {
-        if (isExtractSliceInvariantToLoop(aSlice, innerFor)) {
-          // Move the slice that feeds A outside the inner loop.
-          aSlice->moveBefore(innerFor);
-          // Insert A_pack right AFTER this slice
-          afterA = aSlice.getOperation();
-        }
-      }
-    }
-  }
-
-  // Build A_pack at the chosen insertion point
-  auto aPackOr = buildAPackAt(rewriter, loc, A, mr, afterA, beforeA);
-  if (failed(aPackOr)) return failure();
-  Value aPack = aPackOr->first;
-
-  // Build B_pack right before ukernel
-  OpBuilder::InsertionGuard guard(rewriter);
-  rewriter.setInsertionPoint(ukernel);
-  auto bPackOr = buildBPackAt(rewriter, loc, B, nr);
-  if (failed(bPackOr)) return failure();
-  Value bPack = bPackOr->first;
-
-  // Rewrite ukernel to read from packed A/B and keep C intact
-  auto newUkernelOr = rewriteGenericToUsePackedAB(rewriter, ukernel, aPack, bPack);
-  if (failed(newUkernelOr)) return failure();
-
-  linalg::GenericOp newUkernel = *newUkernelOr;
-  newUkernel->setAttrs({{"microkernel", rewriter.getUnitAttr()}});
-  if (!localResults.empty())
-    localResults[0] = newUkernel.getOperation();
-
-  return success();
-}
-
-static LogicalResult generateOptmizedUkernel(RewriterBase &rewriter,
-                                            linalg::GenericOp ukernel,
-                                            const mKInfo &mK,
-                                            const ArchInfo &arch, 
-                                            SmallVector<Operation*, 6> &resultOps) {
+static Value generateUkernelBody(RewriterBase &rewriter, Location loc,
+    Value A, Value B, Value C_init,
+		mKInfo mK, ArchInfo arch) {
 
 	const int64_t kUnroll = 4;
 
-	OpBuilder::InsertionGuard guard(rewriter);
-	rewriter.setInsertionPoint(ukernel);
-	Location loc = ukernel.getLoc();
 
-	Value A = ukernel.getInputs()[0];
-	Value B = ukernel.getInputs()[1];
-	Value C_init = ukernel.getOutputs()[0];
-
-	Value K_dim = rewriter.create<tensor::DimOp>(loc, A, 1);
+	// Value K_dim = rewriter.create<tensor::DimOp>(loc, A, 1);
 
 	// get ukernel datatype sizes
-    auto shapedTypeA = dyn_cast<ShapedType>(A.getType());
-    Type aType = shapedTypeA.getElementType();
+	auto shapedTypeA = dyn_cast<ShapedType>(A.getType());
+	Type aType = shapedTypeA.getElementType();
 	uint8_t aBitWidth = aType.getIntOrFloatBitWidth();
+	uint64_t kdim_val = shapedTypeA.getDimSize(1);
+	Value K_full = rewriter.create<arith::ConstantIndexOp>(loc, kdim_val);
+	Value K_dim = rewriter.create<arith::ConstantIndexOp>(loc, kdim_val/kUnroll * kUnroll);
+
 
 	// I case we need it in the future (for mixed precision ukernels)
 	// auto shapedTypeB = B.getType().cast<ShapedType>();
@@ -802,8 +767,9 @@ static LogicalResult generateOptmizedUkernel(RewriterBase &rewriter,
 	// Type cType = shapedTypeC.getElementType();
 	// uint8_t cBitWidth = cType.getIntOrFloatBitWidth();
 
-    
-	mKInfo ukDim = findUkernelDimensions(aBitWidth);
+	uint32_t vecLen = (uint8_t) (arch.vec_len / aBitWidth);
+	uint32_t vecsPerCol = mK.ncols / vecLen;
+
 
 	// Constants
 	Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
@@ -818,24 +784,23 @@ static LogicalResult generateOptmizedUkernel(RewriterBase &rewriter,
 
 
 	// Vector Types
-	VectorType vecRowTy = VectorType::get({ukDim.ncols}, aType);
+	VectorType vecTy = VectorType::get({vecLen}, aType);
 
 	SmallVector<Value> accVars;
 	SmallVector<bool> inBoundsRow(1, true); // Rank 1 = 1 bool
 
-	for (int i = 0; i < ukDim.nrows; ++i) {
+	for (int i = 0; i < mK.nrows; ++i) {
 		Value iIdx = rewriter.create<arith::ConstantIndexOp>(loc, i);
-		Value acc = rewriter.create<vector::TransferReadOp>(
-				loc, vecRowTy, C_init, ValueRange{iIdx, c0}, zeroVal, 
-				inBoundsRow);
-		accVars.push_back(acc);
+		for (int j = 0; j < vecsPerCol; ++j) {
+			Value jIdx = rewriter.create<arith::ConstantIndexOp>(loc, j*vecLen);
+			Value acc = rewriter.create<vector::TransferReadOp>(
+					loc, vecTy, C_init, ValueRange{iIdx, jIdx}, zeroVal, 
+					inBoundsRow);
+			accVars.push_back(acc);
+		}
 	}
 
-	// Prefetching could be added here
-	
-	// 2. Main Loop
 	auto loop = rewriter.create<scf::ForOp>(loc, c0, K_dim, step, accVars);
-
 	{
 		OpBuilder::InsertionGuard loopGuard(rewriter);
 		rewriter.setInsertionPointToStart(loop.getBody());
@@ -850,51 +815,159 @@ static LogicalResult generateOptmizedUkernel(RewriterBase &rewriter,
 			Value uIdx = rewriter.create<arith::ConstantIndexOp>(loc, u);
 			Value k = rewriter.create<arith::AddIOp>(loc, k_base, uIdx);
 
-			// A. Load B Row [k, 0...15]
-			// Uses 2 YMM registers (ymm0-ymm1).
-			Value bRow = rewriter.create<vector::TransferReadOp>(
-					loc, vecRowTy, B, ValueRange{c0, k, c0}, zeroVal, 
-					inBoundsRow);
+			SmallVector<Value> bRow;
+			for (int v = 0; v < vecsPerCol; ++v) {
+				Value vIdx = rewriter.create<arith::ConstantIndexOp>(loc, v*vecLen);
+				Value bVec = rewriter.create<vector::TransferReadOp>(
+						loc, vecTy, B, ValueRange{c0, k, vIdx}, zeroVal, inBoundsRow);
+				bRow.push_back(bVec);
+			}
 
-			// B. Interleaved Load/Broadcast/FMA for A
-			// We iterate M by 2 to encourage pairing, though LLVM scheduler handles this.
-			for (int m = 0; m < ukDim.nrows; ++m) {
+			for (int m = 0; m < mK.nrows; ++m) {
 				Value mIdx = rewriter.create<arith::ConstantIndexOp>(loc, m);
 
 				Value aScalar = rewriter.create<tensor::ExtractOp>(
 						loc, A, ValueRange{c0, k, mIdx});
 
 				Value aBcast = rewriter.create<vector::BroadcastOp>(
-						loc, vecRowTy, aScalar);
+						loc, vecTy, aScalar);
 
 				// FMA: Acc[m] += A_bcast * B_row
-				currentAccs[m] = rewriter.create<vector::FMAOp>(
-						loc, aBcast, bRow, currentAccs[m]);
+				for (int v = 0; v < vecsPerCol; ++v) {
+					int accIdx = m * vecsPerCol + v;
+					currentAccs[accIdx] = rewriter.create<vector::FMAOp>(loc, aBcast, bRow[v], currentAccs[accIdx]);
+				}
 			}
 		}
 
 		rewriter.create<scf::YieldOp>(loc, currentAccs);
 	}
 
-	// 3. Write Back
-	Value finalTensor = C_init;
-	for (int i = 0; i < ukDim.nrows; ++i) {
-		Value iIdx = rewriter.create<arith::ConstantIndexOp>(loc, i);
-		Value finalVal = loop.getResult(i);
+	Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+	auto loop_remain = rewriter.create<scf::ForOp>(loc, K_dim, K_full, c1, loop.getResults());
+	{
+		OpBuilder::InsertionGuard loopGuard(rewriter);
+		rewriter.setInsertionPointToStart(loop_remain.getBody());
 
-		finalTensor = rewriter.create<vector::TransferWriteOp>(
-				loc, finalVal, finalTensor, ValueRange{iIdx, c0}, 
-				inBoundsRow).getResult();
+		Value k = loop_remain.getInductionVar();
+
+		SmallVector<Value> currentAccs;
+		for (Value arg : loop_remain.getRegionIterArgs()) currentAccs.push_back(arg);
+
+		SmallVector<Value> bRow;
+		for (int v = 0; v < vecsPerCol; ++v) {
+			Value vIdx = rewriter.create<arith::ConstantIndexOp>(loc, v*vecLen);
+			Value bVec = rewriter.create<vector::TransferReadOp>(
+					loc, vecTy, B, ValueRange{c0, k, vIdx}, zeroVal, inBoundsRow);
+			bRow.push_back(bVec);
+		}
+
+		for (int m = 0; m < mK.nrows; ++m) {
+			Value mIdx = rewriter.create<arith::ConstantIndexOp>(loc, m);
+
+			Value aScalar = rewriter.create<tensor::ExtractOp>(
+					loc, A, ValueRange{c0, k, mIdx});
+
+			Value aBcast = rewriter.create<vector::BroadcastOp>(
+					loc, vecTy, aScalar);
+
+			// FMA: Acc[m] += A_bcast * B_row
+			for (int v = 0; v < vecsPerCol; ++v) {
+				int accIdx = m * vecsPerCol + v;
+				currentAccs[accIdx] = rewriter.create<vector::FMAOp>(loc, aBcast, bRow[v], currentAccs[accIdx]);
+			}
+		}
+
+		rewriter.create<scf::YieldOp>(loc, currentAccs);
 	}
 
-	ukernel->getResult(0).replaceAllUsesWith(finalTensor);
-	ukernel->erase();
+	Value finalTensor = C_init;
 
-	// resultOps.push_back(finalTensor.getDefiningOp());
-  resultOps[0] = finalTensor.getDefiningOp();
-  
+	for (int i = 0; i < mK.nrows; ++i) {
+		Value iIdx = rewriter.create<arith::ConstantIndexOp>(loc, i);
+		for (int j = 0; j < vecsPerCol; ++j){
+			Value jIdx = rewriter.create<arith::ConstantIndexOp>(loc, j*vecLen);
+			Value finalVal = loop_remain.getResult(i*vecsPerCol + j);
 
-	return success();
+			finalTensor = rewriter.create<vector::TransferWriteOp>(
+					loc, finalVal, finalTensor, ValueRange{iIdx, jIdx}, 
+					inBoundsRow).getResult();
+		}
+	}
+
+  return finalTensor;
+}
+
+
+static LogicalResult generateOptmizedUkernel(RewriterBase &rewriter,
+		linalg::GenericOp ukernel,
+		mKInfo mK,
+		ArchInfo arch, 
+		SmallVector<Operation*, 6> &resultOps) {
+
+
+	OpBuilder::InsertionGuard guard(rewriter);
+	rewriter.setInsertionPoint(ukernel);
+	Location loc = ukernel.getLoc();
+
+	Value A = ukernel.getInputs()[0];
+	Value B = ukernel.getInputs()[1];
+	Value C_init = ukernel.getOutputs()[0];
+
+  Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+  Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+  Value currM = rewriter.create<tensor::DimOp>(loc, C_init, c0);
+  Value currN = rewriter.create<tensor::DimOp>(loc, C_init, c1);
+
+  // 2. Define Kernel Constants
+  Value mrVal = rewriter.create<arith::ConstantIndexOp>(loc, mK.nrows);
+  Value nrVal = rewriter.create<arith::ConstantIndexOp>(loc, mK.ncols);
+
+  // 3. Condition: Is this a full tile? (currM == mr && currN == nr)
+  Value isFullM = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, currM, mrVal);
+  Value isFullN = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, currN, nrVal);
+  Value isFullTile = rewriter.create<arith::AndIOp>(loc, isFullM, isFullN);
+
+  auto ifOp = rewriter.create<scf::IfOp>(loc, C_init.getType(), isFullTile, true);
+  // IF then:
+  {
+    OpBuilder::InsertionGuard thenGuard(rewriter);
+    rewriter.setInsertionPointToStart(&ifOp.getThenRegion().front());
+
+    Value result = generateUkernelBody(rewriter, loc, A, B, C_init, mK, arch);
+
+    rewriter.create<scf::YieldOp>(loc, result);
+  }
+  // ELSE:
+  {
+    OpBuilder::InsertionGuard elseGuard(rewriter);
+    rewriter.setInsertionPointToStart(&ifOp.getElseRegion().front());
+
+    SmallVector<int64_t> staticShape = {mK.nrows, mK.ncols};
+    Value paddedC = padTileToStaticShape(rewriter, loc, C_init, staticShape);
+
+    Value computedPaddedC = generateUkernelBody(rewriter, loc, A, B, paddedC, mK, arch);
+
+    SmallVector<OpFoldResult> offsets = {rewriter.getIndexAttr(0), rewriter.getIndexAttr(0)};
+    SmallVector<OpFoldResult> sizes = {currM, currN};
+    SmallVector<OpFoldResult> strides = {rewriter.getIndexAttr(1), rewriter.getIndexAttr(1)};
+
+    Value unpaddedResult = rewriter.create<tensor::ExtractSliceOp>(
+        loc, computedPaddedC, offsets, sizes, strides);
+
+    Value castResult = rewriter.create<tensor::CastOp>(
+        loc, C_init.getType(), unpaddedResult);
+
+    rewriter.create<scf::YieldOp>(loc, castResult);
+  }
+
+
+
+  ukernel->getResult(0).replaceAllUsesWith(ifOp.getResult(0));
+  ukernel->erase();
+  resultOps[0] = ifOp.getOperation();
+
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -902,7 +975,7 @@ static LogicalResult generateOptmizedUkernel(RewriterBase &rewriter,
 //===----------------------------------------------------------------------===//
 
 /// Selects block (tiling) sizes for a GEMM at two levels  
-static GemmTileSizes computeGemmTiles(const mKInfo &mK, const ArchInfo &arch) {
+static GemmTileSizes computeGemmTiles(mKInfo mK, ArchInfo arch) {
 
   GemmTileSizes ts;
   // Map SConv-style knobs into GEMM intuitively:
@@ -931,8 +1004,8 @@ static GemmTileSizes computeGemmTiles(const mKInfo &mK, const ArchInfo &arch) {
 /// Produces: outer tiling (Mc,Kc,Nc) with interchange {0,2,1} (loops: i, j, k),
 /// then, apply inner tiling (mr,0,nr) on the inner tiled op.
 static LogicalResult
-applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *target,
-                const mKInfo &mK, const ArchInfo &arch,
+applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *target, 
+                GemmOriginalSizes origSizes, mKInfo mK, ArchInfo arch,
                 SmallVector<Operation*, 6> &outResults) {
 
   SmallVector<Operation *> tiledOps;
@@ -998,7 +1071,7 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
   }
 
   // Build A_pack at the chosen insertion point
-  auto aPackOr = buildAPackAt(rewriter, loc, A, mr, afterA, beforeA);
+  auto aPackOr = buildAPackAt(rewriter, loc, A, origSizes, ts, mK, afterA, beforeA);
   if (failed(aPackOr)) return failure();
   Value aPack = aPackOr->first;
 
@@ -1047,7 +1120,7 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
   // Build B_pack right before ukernel
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPoint(innerOp);
-  auto bPackOr = buildBPackAt(rewriter, innerLoc, B, nr);
+  auto bPackOr = buildBPackAt(rewriter, innerLoc, B, origSizes, ts, mK);
   if (failed(bPackOr)) return failure();
   Value bPack = bPackOr->first;
 
@@ -1184,35 +1257,18 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
 
   // Initialize the default values of mKInfo & ArchInfo.
   // It's dependent of the target machine.
-  mKInfo mK = {8, 16, 128};
+  mKInfo mK;
   ArchInfo arch = {
-      (uint32_t)(32768),
-      (uint32_t)(1048576),
-      (uint32_t)(4194304)
+	  .l1_size = 32768,
+	  .l2_size = 1048576,
+	  .l3_size = 4194304,
+	  .vec_len = 256,
+	  .num_vecs = 16,
+	  .is_risc = 0
   };
 
   // Get the optional arguments
-  auto mKInfoAttr = getMKInfo(); // This will be useless in the future, as micro-kernel sizes will be problem/arch dependent.
   auto archInfoAttr = getArchInfo();
-
-  // If `mKInfoAttr` was provided, use the given values
-  if (mKInfoAttr) {
-    SmallVector<int64_t, 4> mKValues;
-    for (auto attr : mKInfoAttr->getValue()) {
-      if (auto intAttr = dyn_cast<IntegerAttr>(attr)) {
-        mKValues.push_back(intAttr.getInt());
-      } else {
-        return emitSilenceableError() << "Error: mKInfoAttr contains non-integer values!\n";
-      }
-    }
-    if (mKValues.size() >= 2) {
-      mK.nrows = mKValues[0];
-      mK.ncols = mKValues[1];
-      mK.noutput = mK.nrows * mK.ncols;
-    } else {
-      return emitSilenceableError() << "Error: mKInfoAttr does not contain enough values!\n";
-    }
-  }
 
   // If `archInfoAttr` was provided, use the given values
   if (archInfoAttr) {
@@ -1256,49 +1312,28 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
       Type aType = shapedTypeA.getElementType();
       uint8_t aBitWidth = aType.getIntOrFloatBitWidth();
 
+      auto shapedTypeB = dyn_cast<ShapedType>(A.getType());
+      Type bType = shapedTypeA.getElementType();
+
+      GemmOriginalSizes origSizes = {
+        .M = shapedTypeA.getDimSize(0),
+        .K = shapedTypeA.getDimSize(1),
+        .N = shapedTypeB.getDimSize(1)
+      };
+
+      if (ShapedType::isDynamic(origSizes.M) || ShapedType::isDynamic(origSizes.K) || ShapedType::isDynamic(origSizes.N))
+        return emitSilenceableError() << "Dynamic dimensions are not supported.";
+
       mK = findUkernelDimensions(aBitWidth);
 
       linalg::GenericOp genericOp = *res;
       // Compute tile sizes once (we need them for padding multiples).
       GemmTileSizes ts = computeGemmTiles(mK, arch);
 
-      // Padding scaffolding: extract A/B/C, set IP, and build tensor.pad if needed.
-      auto mpOr = preparePaddingForGemmLike(rewriter, genericOp, ts);
-      if (failed(mpOr)) {
-        // Non-fatal: just proceed without padding for now.
-      } else {
-        const MaybePaddedABC &mp = *mpOr;
-
-        // Rewire the GEMM to use padded A/B/C by cloning a new generic just before tiling.
-        {
-          OpBuilder::InsertionGuard guard(rewriter);
-          rewriter.setInsertionPoint(genericOp);
-          SmallVector<AffineMap> maps = llvm::to_vector(genericOp.getIndexingMapsArray());
-          SmallVector<utils::IteratorType> iters = llvm::to_vector(genericOp.getIteratorTypesArray());
-
-          Type outTy = mp.C.getType();
-          auto cloned = rewriter.create<linalg::GenericOp>(
-              genericOp.getLoc(),
-              /*resultTensorTypes=*/TypeRange{outTy},
-              /*inputs=*/ValueRange{mp.A, mp.B},
-              /*outputs=*/ValueRange{mp.C},
-              /*indexingMaps=*/maps,
-              /*iteratorTypes=*/iters,
-              [&](OpBuilder &b, Location loc, ValueRange args) {
-                // args = {Aelt, Belt, Celt}
-                Value mul = createMul(loc, args[0], args[1], b);
-                Value sum = createAdd(loc, mul, args[2], b);
-                b.create<linalg::YieldOp>(loc, sum);
-              });
-          rewriter.replaceOp(genericOp, cloned->getResults());
-          genericOp = cloned;
-        }
-      }
-
       SmallVector<Operation*, 6> localResults;
 
       // linalg::GenericOp genericOp = *res;
-      if (failed(applyTileToGemm(rewriter, getOperation(), genericOp.getOperation(), mK, arch, localResults)))
+      if (failed(applyTileToGemm(rewriter, getOperation(), genericOp.getOperation(), origSizes, mK, arch, localResults)))
         return emitSilenceableError() << "Failed to apply tiling.";
 
       // First result in localResults contains the tiled uKernel
