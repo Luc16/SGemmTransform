@@ -22,6 +22,7 @@ add_mlir_library(
   MLIRFuncDialect
   MLIRSCFDialect
   MLIRSCFUtils
+  MLIRLinalgTransforms
   MLIRSCFTransforms
   MLIRAffineDialect
   MLIRVectorDialect

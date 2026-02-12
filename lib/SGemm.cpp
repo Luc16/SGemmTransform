@@ -6,6 +6,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
@@ -136,7 +137,8 @@ static int64_t roundUp(int64_t size, int64_t multiple) {
 mKInfo findUkernelDimensions(uint8_t aBitWidth) {
 	uint8_t nrows = 6;
 	uint8_t ncols = 16*32 / aBitWidth; // Adjust columns based on datatype size
-	return {nrows, ncols, 4, static_cast<uint16_t>(nrows * ncols)};
+  uint8_t unroll = 4; // Unroll factor for the micro-kernel
+	return {nrows, ncols, unroll, static_cast<uint16_t>(nrows * ncols)};
 }
 
 /// Pad `tensor` so that selected dimensions become multiples of the given `multiples`.
@@ -645,6 +647,145 @@ buildBPackAt(RewriterBase &rewriter, Location loc, Value B, GemmOriginalSizes or
   return std::make_pair(bPack.getResult(0), bPackTy);
 }
 
+static LogicalResult generateOptimizedPacking(
+    RewriterBase &rewriter, linalg::GenericOp generic,
+    GemmOriginalSizes origSizes, mKInfo mK) {
+
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(generic);
+  Location loc = generic.getLoc();
+
+  // 1. Optimize B-Packing (The Performance Critical Part)
+  //    Target: B[K, N] -> PackB[N/nr, K, nr]
+  //    Optimization: Contiguous Load (N) -> Contiguous Store (nr)
+  if (generic->hasAttr("BPacking")) {
+    Value B = generic.getInputs()[0];
+    Value PackB = generic.getOutputs()[0];
+    auto bType = cast<RankedTensorType>(B.getType());
+    Type elemType = bType.getElementType();
+
+    // Create Constants
+    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value nrVal = rewriter.create<arith::ConstantIndexOp>(loc, mK.ncols);
+    
+    // Get Dimensions (Dynamic-safe)
+    Value K = rewriter.create<tensor::DimOp>(loc, B, 0);
+    Value N = rewriter.create<tensor::DimOp>(loc, B, 1);
+
+    // Vector Type: vector<nr x f32/f64>
+    VectorType vecType = VectorType::get({mK.ncols}, elemType);
+    Value zero = buildZeroLike(rewriter, loc, elemType);
+
+    SmallVector<bool> inBoundsRow(1, true); // Rank 1 = 1 bool
+    
+    // Outer Loop: J (0 to N, step nr)
+    // We carry the packed tensor through the loop arguments
+    auto jLoop = rewriter.create<scf::ForOp>(loc, c0, N, nrVal, ValueRange{PackB});
+    {
+      OpBuilder::InsertionGuard jGuard(rewriter);
+      rewriter.setInsertionPointToStart(jLoop.getBody());
+      Value packBIterJ = jLoop.getRegionIterArg(0);
+      Value j = jLoop.getInductionVar();
+
+      // Inner Loop: K (0 to K, step 1)
+      auto kLoop = rewriter.create<scf::ForOp>(loc, c0, K, c1, ValueRange{packBIterJ});
+      {
+        OpBuilder::InsertionGuard kGuard(rewriter);
+        rewriter.setInsertionPointToStart(kLoop.getBody());
+        Value packBIterK = kLoop.getRegionIterArg(0);
+        Value k = kLoop.getInductionVar();
+
+        // 1. Contiguous Load: Read vector from B[k, j]
+        //    Since B is padded/peeled, we can safely set in_bounds=true
+        Value vec = rewriter.create<vector::TransferReadOp>(
+            loc, vecType, B, ValueRange{k, j}, zero,
+            inBoundsRow);
+
+        // 2. Contiguous Store: Write vector to PackB[j/nr, k, 0]
+        Value jDivNr = rewriter.create<arith::DivUIOp>(loc, j, nrVal);
+        Value c0_idx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+        
+        Value newPackB = rewriter.create<vector::TransferWriteOp>(
+            loc, vec, packBIterK, ValueRange{jDivNr, k, c0_idx},
+            inBoundsRow).getResult();
+
+        rewriter.create<scf::YieldOp>(loc, newPackB);
+      }
+      rewriter.create<scf::YieldOp>(loc, kLoop.getResult(0));
+    }
+
+    // Replace the generic op with the result of the loops
+    rewriter.replaceOp(generic, jLoop.getResult(0));
+    return success();
+  }
+
+  if (generic->hasAttr("APacking")) {
+    Value A = generic.getInputs()[0];
+    Value PackA = generic.getOutputs()[0];
+    auto aType = cast<RankedTensorType>(A.getType());
+
+    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value mrVal = rewriter.create<arith::ConstantIndexOp>(loc, mK.nrows); // 6
+    Value M = rewriter.create<tensor::DimOp>(loc, A, 0);
+    Value K = rewriter.create<tensor::DimOp>(loc, A, 1);
+
+    // Vector size for K-dimension (Contiguous in A)
+    // We load a vector of size 6 (or 8) along K
+    int vecSize = mK.nrows; 
+    VectorType vecTy = VectorType::get({vecSize}, aType.getElementType());
+    Value zero = buildZeroLike(rewriter, loc, aType.getElementType());
+
+    // Loop I (M) step mr
+    auto iLoop = rewriter.create<scf::ForOp>(loc, c0, M, mrVal, ValueRange{PackA});
+    {
+      OpBuilder::InsertionGuard iGuard(rewriter);
+      rewriter.setInsertionPointToStart(iLoop.getBody());
+      Value packAIterI = iLoop.getRegionIterArg(0);
+      Value i = iLoop.getInductionVar();
+
+      // Loop K (K) step 1
+      // Note: For perfect vectorization we would unroll K by vector_width, 
+      // but A-packing is strided writes, so simple vector reads help enough.
+      auto kLoop = rewriter.create<scf::ForOp>(loc, c0, K, c1, ValueRange{packAIterI});
+      {
+        OpBuilder::InsertionGuard kGuard(rewriter);
+        rewriter.setInsertionPointToStart(kLoop.getBody());
+        Value packAIterK = kLoop.getRegionIterArg(0);
+        Value k = kLoop.getInductionVar();
+
+        // Read 6 elements from A[i..i+6, k]
+        // A is Row-Major, so A[i, k] and A[i+1, k] are NOT contiguous.
+        // We actually need to load SCALARS here unless we unroll K.
+        // A simple unroll-and-jam is better here. 
+        // BUT, simply eliminating the Generic overhead is a win.
+
+        // Manual scalar loop unrolled:
+        Value currentPack = packAIterK;
+        Value iDivMr = rewriter.create<arith::DivUIOp>(loc, i, mrVal);
+
+        for(int r=0; r<mK.nrows; ++r) {
+          Value rIdx = rewriter.create<arith::ConstantIndexOp>(loc, r);
+          Value iPlusR = rewriter.create<arith::AddIOp>(loc, i, rIdx);
+
+          // Read A[i+r, k]
+          Value val = rewriter.create<tensor::ExtractOp>(loc, A, ValueRange{iPlusR, k});
+
+          // Write PackA[i/mr, k, r]
+          currentPack = rewriter.create<tensor::InsertOp>(
+              loc, val, currentPack, ValueRange{iDivMr, k, rIdx});
+        }
+        rewriter.create<scf::YieldOp>(loc, currentPack);
+      }
+      rewriter.create<scf::YieldOp>(loc, kLoop.getResult(0));
+    }
+    rewriter.replaceOp(generic, iLoop.getResult(0));
+    return success();
+  }
+  return failure();
+}
+
 /// Rewrite ukernel (linalg.generic) to read from A_pack / B_pack.
 /// Keeps the same output (C tile) and body (mul+add), only remaps inputs.
 static FailureOr<linalg::GenericOp>
@@ -762,7 +903,7 @@ static Value generateUkernelBody(RewriterBase &rewriter, Location loc,
     Value A, Value B, Value C_init,
 		mKInfo mK, ArchInfo arch) {
 
-	const int64_t kUnroll = 4;
+	const int64_t kUnroll = mK.unroll; // unroll factor for K dimension (reduction dim)
 
 
 	// Value K_dim = rewriter.create<tensor::DimOp>(loc, A, 1);
@@ -917,7 +1058,7 @@ static Value generateUkernelBody(RewriterBase &rewriter, Location loc,
 }
 
 
-static LogicalResult generateOptmizedUkernel(RewriterBase &rewriter,
+static LogicalResult generateOptimizedUkernel(RewriterBase &rewriter,
 		linalg::GenericOp ukernel,
     GemmOriginalSizes origSizes,
 		mKInfo mK,
@@ -1036,11 +1177,13 @@ static GemmTileSizes computeGemmTiles(mKInfo mK, ArchInfo arch) {
 /// then, apply inner tiling (mr,0,nr) on the inner tiled op.
 static LogicalResult
 applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *target, 
-                GemmOriginalSizes origSizes, mKInfo mK, ArchInfo arch,
-                SmallVector<Operation*, 6> &outResults) {
+                GemmOriginalSizes origSizes, mKInfo mK, ArchInfo arch, 
+                SmallVector<Operation*, 2> &outPacking, SmallVector<Operation*, 6> &outResults) {
 
   SmallVector<Operation *> tiledOps;
   SmallVector<Operation *> loopOps;
+
+  int64_t vec_len = arch.vec_len / origSizes.type;
 
   auto tilingInterfaceOp = dyn_cast<TilingInterface>(target);
   if (!tilingInterfaceOp)
@@ -1119,6 +1262,7 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
   if (failed(aPackOr)) return failure();
   Value aPack = aPackOr->first;
 
+  outPacking.push_back(aPack.getDefiningOp());
 
   auto outer2TilingInterfaceOp = dyn_cast<TilingInterface>(outer2Op);
   if (!outer2TilingInterfaceOp)
@@ -1173,6 +1317,8 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
   auto bPackOr = buildBPackAt(rewriter, innerLoc, B, origSizes, ts, mK);
   if (failed(bPackOr)) return failure();
   Value bPack = bPackOr->first;
+
+  outPacking.push_back(bPack.getDefiningOp());
 
   auto newInnerOr = rewriteGenericToUsePackedAB(rewriter, cast<linalg::GenericOp>(innerOp), aPack, bPack);
   if (failed(newInnerOr)) return failure();
@@ -1368,7 +1514,8 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
       GemmOriginalSizes origSizes = {
         .M = shapedTypeA.getDimSize(0),
         .K = shapedTypeA.getDimSize(1),
-        .N = shapedTypeB.getDimSize(1)
+        .N = shapedTypeB.getDimSize(1),
+        .type = aBitWidth
       };
 
       if (ShapedType::isDynamic(origSizes.M) || ShapedType::isDynamic(origSizes.K) || ShapedType::isDynamic(origSizes.N))
@@ -1381,15 +1528,23 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
       GemmTileSizes ts = computeGemmTiles(mK, arch);
 
       SmallVector<Operation*, 6> localResults;
+      SmallVector<Operation*, 2> packingOps;
 
       // linalg::GenericOp genericOp = *res;
-      if (failed(applyTileToGemm(rewriter, getOperation(), genericOp.getOperation(), origSizes, mK, arch, localResults)))
+      if (failed(applyTileToGemm(rewriter, getOperation(), genericOp.getOperation(), origSizes, mK, arch, packingOps, localResults)))
         return emitSilenceableError() << "Failed to apply tiling.";
+
+      for (auto* packOp : packingOps) {
+        if (auto genOp = dyn_cast<linalg::GenericOp>(packOp)) {
+          if (failed(generateOptimizedPacking(rewriter, genOp, origSizes, mK)))
+            return emitSilenceableError() << "Failed to generate vectorized packing.";
+        }
+      }
 
       // First result in localResults contains the tiled uKernel
       if (!localResults.empty() && localResults[0]) {
         if (auto ukernel = dyn_cast<linalg::GenericOp>(localResults[0])) {
-          if (failed(generateOptmizedUkernel(rewriter, ukernel, origSizes, mK, arch, localResults)))
+          if (failed(generateOptimizedUkernel(rewriter, ukernel, origSizes, mK, arch, localResults)))
             return emitSilenceableError() << "Failed to generate microkernel.";
           
           // if (failed(packAndRetargetUkernel(rewriter, ukernel, mK, localResults)))

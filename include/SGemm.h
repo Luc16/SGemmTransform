@@ -191,7 +191,7 @@ struct GemmTileSizes {
 };
 
 struct GemmOriginalSizes {
-	int64_t M = 0, K = 0, N = 0;
+	int64_t M = 0, K = 0, N = 0, type = 0;
 };
 
 enum class PadNeed { None, Needed, Maybe };
