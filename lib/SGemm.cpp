@@ -7,8 +7,12 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Utils/Utils.h"
+#include "mlir/Dialect/SCF/Transforms/Transforms.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Builders.h"
@@ -564,10 +568,17 @@ buildAPackAt(RewriterBase &rewriter, Location loc, Value A,
 
   int64_t pKc = (origSizes.K > ts.Kc) ? ts.Kc : origSizes.K; // handle Kc tail case with smaller reduction size
   int64_t pMc = (origSizes.M > ts.Mc) ? ts.Mc : origSizes.M; // handle Mc tail case by rounding up to next multiple of mr
-  pKc = roundUp(pKc, mK.unroll); // ensure Kc is a multiple of mK.ncols for the packing math to work out
-  pMc = roundUp(pMc, mK.nrows); // ensure Mc is a multiple of mK.nrows for the packing math to work out
 
-  Value paddedA = padTileToStaticShape(rewriter, loc, A, {pMc, pKc});
+
+  Value paddedA;
+
+  if (pKc % mK.unroll == 0 && pMc % mK.nrows == 0) {
+    paddedA = A;
+  } else {
+    pKc = roundUp(pKc, mK.unroll); // ensure Kc is a multiple of mK.ncols for the packing math to work out
+    pMc = roundUp(pMc, mK.nrows); // ensure Mc is a multiple of mK.nrows for the packing math to work out
+    paddedA = padTileToStaticShape(rewriter, loc, A, {pMc, pKc});
+  }
 
   SmallVector<int64_t> targetShape = {pMc/mK.nrows, pKc, mK.nrows};
   auto aPackTy = RankedTensorType::get(targetShape, aType.getElementType());
@@ -601,10 +612,17 @@ buildBPackAt(RewriterBase &rewriter, Location loc, Value B, GemmOriginalSizes or
 
   int64_t pKc = (origSizes.K > ts.Kc) ? ts.Kc : origSizes.K; // handle Kc tail case with smaller reduction size
   int64_t pNc = (origSizes.N > ts.Nc) ? ts.Nc : origSizes.N; // handle Nc tail case by rounding up to next multiple of mr
-  pKc = roundUp(pKc, mK.unroll); // ensure Kc is a multiple of mK.ncols for the packing math to work out
-  pNc = roundUp(pNc, mK.ncols); // ensure Mc is a multiple of mK.nrows for the packing math to work out
 
-  Value paddedB = padTileToStaticShape(rewriter, loc, B, {pKc, pNc});
+  // Value paddedB = padTileToStaticShape(rewriter, loc, B, {pKc, pNc});
+  Value paddedB;
+
+  if (pKc % mK.unroll == 0 && pNc % mK.ncols == 0) {
+    paddedB = B;
+  } else {
+    pKc = roundUp(pKc, mK.unroll); // ensure Kc is a multiple of mK.ncols for the packing math to work out
+    pNc = roundUp(pNc, mK.ncols); // ensure Mc is a multiple of mK.nrows for the packing math to work out
+    paddedB = padTileToStaticShape(rewriter, loc, B, {pKc, pNc});
+  }
 
   SmallVector<int64_t> targetShape = {pNc/mK.ncols, pKc, mK.ncols};
   auto bPackTy = RankedTensorType::get(targetShape, bType.getElementType());
@@ -901,6 +919,7 @@ static Value generateUkernelBody(RewriterBase &rewriter, Location loc,
 
 static LogicalResult generateOptmizedUkernel(RewriterBase &rewriter,
 		linalg::GenericOp ukernel,
+    GemmOriginalSizes origSizes,
 		mKInfo mK,
 		ArchInfo arch, 
 		SmallVector<Operation*, 6> &resultOps) {
@@ -913,6 +932,18 @@ static LogicalResult generateOptmizedUkernel(RewriterBase &rewriter,
 	Value A = ukernel.getInputs()[0];
 	Value B = ukernel.getInputs()[1];
 	Value C_init = ukernel.getOutputs()[0];
+
+  if (origSizes.M % mK.nrows == 0 && origSizes.N % mK.ncols == 0) {
+
+    Value computedC = generateUkernelBody(rewriter, loc, A, B, C_init, mK, arch);
+
+    ukernel->getResult(0).replaceAllUsesWith(computedC);
+    ukernel->erase();
+    resultOps[0] = computedC.getDefiningOp();
+
+    return success();
+
+  }
 
   Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
   Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
@@ -1044,6 +1075,19 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
     rewriter.eraseOp(tilingInterfaceOp);
   }
 
+  // for (Operation *loopOp : outerRes->loops) {
+  //   auto forOp = dyn_cast<scf::ForOp>(loopOp);
+  //   if (!forOp) continue;
+  //
+  //   // This creates the "split": efficient main loop + tail loop
+  //   scf::ForOp partialLoop;
+  //   if (failed(scf::peelForLoopAndSimplifyBounds(rewriter, forOp, partialLoop))) {
+  //
+  //     // Peeling might fail if the step divides the bound evenly (no tail).
+  //     // This is fine, we just ignore it.
+  //   }
+  // }
+
   Operation *outer2Op = outerRes->tiledOps.front();
   Location loc = outer2Op->getLoc();
   int64_t mr = mK.nrows;
@@ -1109,6 +1153,12 @@ applyTileToGemm(RewriterBase &rewriter, Operation *transformOp, Operation *targe
     rewriter.replaceOp(outer2TilingInterfaceOp, outer2Res->tiledOps.front()->getResults());
   } else {
     rewriter.eraseOp(outer2TilingInterfaceOp);
+
+    // auto nLoop = dyn_cast<scf::ForOp>(outer2Res->loops.front()); // The N loop
+    // scf::ForOp partialNLoop;
+    // if (failed(scf::peelForLoopAndSimplifyBounds(rewriter, nLoop, partialNLoop))) {
+    //
+    // }
   }
 
   Operation *innerOp = outer2Res->tiledOps.front();
@@ -1339,7 +1389,7 @@ transform::SGemmOp::apply(transform::TransformRewriter &rewriter,
       // First result in localResults contains the tiled uKernel
       if (!localResults.empty() && localResults[0]) {
         if (auto ukernel = dyn_cast<linalg::GenericOp>(localResults[0])) {
-          if (failed(generateOptmizedUkernel(rewriter, ukernel, mK, arch, localResults)))
+          if (failed(generateOptmizedUkernel(rewriter, ukernel, origSizes, mK, arch, localResults)))
             return emitSilenceableError() << "Failed to generate microkernel.";
           
           // if (failed(packAndRetargetUkernel(rewriter, ukernel, mK, localResults)))
